@@ -81,7 +81,8 @@ requireRegex = /(?:^|[^\w\$_.\(])require\s*\(\s*("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\
 defineStaticRequireRegex = /^[\r\n\s]*define\(\s*("\S+",|'\S+',|\s*)\s*\[([^\]]*)\],\s*(function\s*\(|{).+/
 requireGreedyCapture = /require.*/
 commentRegex = /(\/\*([\s\S]*?)\*\/|([^:]|^)\/\/(.*)$)/mg
-relativePathRegex = /^(.\/|..\/).*/
+relativePathRegex = /^(\.{1,2}\/).+/
+absolutePathRegex = /^([A-Za-z]+:)?\/\//
 
 ###
 lscache configuration
@@ -621,6 +622,8 @@ reset = () ->
     "xd":
       "inject": null                  # the location of the relay.html file, same domain as inject
       "xhr": null                     # the location of the relay.html file, same domain as moduleRoot
+    "debug":
+      "sourceMap": false
 reset()
 
 
@@ -782,6 +785,7 @@ loadModules = (modList, callback) ->
     if outstandingAMDModules is 0 then amdComplete()
 
   for moduleId in modList
+    moduleId = standardizeModuleId(moduleId)
     node = new treeNode(moduleId)
     dispatchTreeDownload(id, tree, node, execute)
 
@@ -943,14 +947,19 @@ applyRules = (moduleId, save, relativePath) ->
     workingPath = if typeof(rule.path) is "string" then rule.path else rule.path(workingPath)
     if rule?.pointcuts?.before then pointcuts.before.push(rule.pointcuts.before)
     if rule?.pointcuts?.after then pointcuts.after.push(rule.pointcuts.after)
+  
   # apply global rules for all paths
-  if workingPath.indexOf("/") isnt 0
-    if typeof(userConfig.moduleRoot) is "undefined" then throw new Error("Module Root must be defined")
-    else if typeof(userConfig.moduleRoot) is "string" then workingPath = "#{userConfig.moduleRoot}#{workingPath}"
-    else if typeof(userConfig.moduleRoot) is "function" then workingPath = userConfig.moduleRoot(workingPath)
+  # if the stack has yielded an http:// URL, stop mucking with it
+  if !absolutePathRegex.test(workingPath)
+    # does not begin with a /. This makes it relative
+    if workingPath.indexOf("/") isnt 0
+      if typeof(userConfig.moduleRoot) is "undefined" then throw new Error("Module Root must be defined")
+      else if typeof(userConfig.moduleRoot) is "string" then workingPath = "#{userConfig.moduleRoot}#{workingPath}"
+      else if typeof(userConfig.moduleRoot) is "function" then workingPath = userConfig.moduleRoot(workingPath)
 
-  if typeof(relativePath) is "string"
-    workingPath = basedir(relativePath) + moduleId
+    # if we have a relative path, resolve based on that
+    if typeof(relativePath) is "string"
+      workingPath = basedir(relativePath) + moduleId
 
   if !fileSuffix.test(workingPath) then workingPath = "#{workingPath}.js"
 
@@ -993,12 +1002,10 @@ executeFile = (moduleId) ->
                          .replace(/__POINTCUT_BEFORE__/g, cuts.before)
   footer = commonJSFooter.replace(/__INJECT_NS__/g, namespace)
                          .replace(/__POINTCUT_AFTER__/g, cuts.after)
-  sourceString = if isIE then "" else "//@ sourceURL=#{path}"
   
   runHeader = header + "\n"
-  runCmd = [runHeader, text, ";", footer, sourceString].join("\n")
-  
-  # todo: circular dependency resolution
+  runCmd = [runHeader, text, ";", footer].join("\n")
+
   module = evalModule({
     moduleId: moduleId
     cmd: runCmd
@@ -1061,7 +1068,16 @@ evalModule = (options) ->
     # if there was a parse error, we got juicy details
     # execute the function, which will use onerror() again if we hit a
     # problem
-    module = Inject.execute[functionId]()
+
+    # select our execution engine (if advanced debugging is required)
+    if (userConfig.debug.sourceMap)
+      sourceString = if isIE then "" else "//@ sourceURL=#{url}"
+      toExec = (["(",Inject.execute[functionId].toString(),")()"]).join("")
+      toExec = ([toExec, sourceString]).join("\n")
+      module = eval(toExec)
+    else
+      module = Inject.execute[functionId]()
+    
     if module.error
       actualErrorLine = onErrorOffset - preambleLines + getLineNumberFromException(module.error)
       message = "Parse error in #{moduleId} (#{url}) on line #{actualErrorLine}:\n  #{module.error.message}"
@@ -1167,6 +1183,19 @@ basedir = (path) ->
     path = path.substring(0, path.lastIndexOf("/") + 1)
   return path
 
+standardizeModuleId = (moduleId) ->
+  for rule in db.queue.rules.get()
+    if typeof(rule.path) is "string" and rule.path.replace(/.js$/i, '') == moduleId
+      moduleId = rule.key
+  return moduleId
+
+stripBuiltIns = (modules) ->
+  strippedModuleList = []
+  for mId in modules
+    if mId isnt "require" and mId isnt "exports" and mId isnt "module"
+      strippedModuleList.push(mId)
+  return strippedModuleList
+
 ###
 Main Payloads: require, require.ensure, etc
 ###
@@ -1184,10 +1213,7 @@ require = (moduleId, callback = ->) ->
   ###
   if Object.prototype.toString.call(moduleId) is "[object Array]"
     # amd compliant require()
-    strippedModuleList = []
-    for mId in moduleId
-      if mId isnt "require" and mId isnt "exports" and mId isnt "module"
-        strippedModuleList.push(mId)
+    strippedModuleList = stripBuiltIns(moduleId)
     require.ensure(strippedModuleList, (require, module, exports) ->
       args = []
       for mId in moduleId
@@ -1200,6 +1226,7 @@ require = (moduleId, callback = ->) ->
     )
     return
 
+  moduleId = standardizeModuleId(moduleId)
   exports = db.module.getExports(moduleId)
   isCircular = db.module.getCircular(moduleId)
   
@@ -1216,6 +1243,7 @@ require.run = (moduleId) ->
   ## require.run(moduleId) ##
   Try to getFile for moduleId, if the file exists, execute the file, if not, load this file and run it
   ###
+  moduleId = standardizeModuleId(moduleId)
   if db.module.getFile(moduleId) is false
     require.ensure([moduleId], () ->)
   else
@@ -1232,6 +1260,9 @@ require.ensure = (moduleList, callback) ->
   # Assert moduleList is an Array or throw an exception.
   if moduleList not instanceof Array
     throw new Error("moduleList is not an Array")
+
+  # strip builtins from ensure...
+  moduleList = stripBuiltIns(moduleList)
 
   # init the iframe if required
   if userConfig.xd.xhr? and !xDomainRpc and !pauseRequired
@@ -1429,8 +1460,7 @@ context['Inject'] = {
   'define': define,
   'reset': reset,
   'execute': {},
-  'debug': () ->
-    console?.dir(_db)
+  'enableDebug': (key, value = true) -> userConfig.debug[key] = value
 }
 context['require']['ensure'] = require.ensure;
 context['require']['setModuleRoot'] = require.setModuleRoot;
